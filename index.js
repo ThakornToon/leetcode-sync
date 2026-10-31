@@ -24,7 +24,7 @@ async function main() {
     repo = context.repo.repo;
     leetcodeCSRFToken = core.getInput('leetcode-csrf-token');
     leetcodeSession = core.getInput('leetcode-session');
-    filterDuplicateSecs = core.getInput('filter-duplicate-secs');
+    filterDuplicateSecs = Number(core.getInput('filter-duplicate-secs')) || 86400;
     destinationFolder = core.getInput('destination-folder');
   }
 

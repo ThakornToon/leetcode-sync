@@ -30,6 +30,7 @@ const LANG_TO_EXTENSION = {
   'typescript': 'ts',
 };
 const BASE_URL = 'https://leetcode.com';
+const GRAPHQL_URL = `${BASE_URL}/graphql/`;
 
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
@@ -65,7 +66,7 @@ async function getSubmissionCode(submission, session, csrfToken) {
 
   const getCode = async (maxRetries = 5, retryCount = 0) => {
     try {
-      const response = await axios.post('https://leetcode.com/graphql/', data, {
+      const response = await axios.post(GRAPHQL_URL, data, {
         headers,
       });
       const code = response.data?.data?.submissionDetails?.code;
@@ -113,7 +114,7 @@ async function getQuestionData(titleSlug, session, csrfToken) {
 
   const fetchQuestion = async (maxRetries = 5, retryCount = 0) => {
     try {
-      const response = await axios.post('https://leetcode.com/graphql/', data, {
+      const response = await axios.post(GRAPHQL_URL, data, {
         headers,
       });
       const content = response.data?.data?.question?.content;
@@ -159,7 +160,7 @@ async function commit(params) {
   log(`Committing solution for ${name}...`);
 
   if (!LANG_TO_EXTENSION[submission.lang]) {
-    throw `Language ${submission.lang} does not have a registered extension.`;
+    throw new Error(`Language ${submission.lang} does not have a registered extension.`);
   }
 
   const prefix = !!destinationFolder ? `${destinationFolder}/` : '';
@@ -247,9 +248,10 @@ function addToSubmissions(params) {
       submissions_dict[name] = {};
     }
     // Filter out other accepted solutions less than one day from the most recent one.
+    const duplicateWindowSecs = Number(filterDuplicateSecs) || 86400;
     if (
       submissions_dict[name][lang] &&
-      submissions_dict[name][lang] - submissionTimestamp < filterDuplicateSecs
+      submissions_dict[name][lang] - submissionTimestamp < duplicateWindowSecs
     ) {
       continue;
     }
@@ -283,7 +285,7 @@ async function sync(inputs) {
   });
 
   let lastTimestamp = 0;
-  // commitInfo is used to get the original name / email to use for the author / committer. 
+  // commitInfo is used to get the original name / email to use for the author / committer.
   // Since we need to modify the commit time, we can't use the default settings for the
   // authenticated user.
   let commitInfo = commits.data[commits.data.length - 1].commit.author;
@@ -301,70 +303,67 @@ async function sync(inputs) {
   let offset = 0;
   const submissions = [];
   const submissions_dict = {};
+
+  const fetchSubmissionsPage = async (offset, maxRetries, retryCount = 0) => {
+    try {
+      const graphql = JSON.stringify({
+        query: `query ($offset: Int!, $limit: Int!, $slug: String) {
+            submissionList(offset: $offset, limit: $limit, questionSlug: $slug) {
+                hasNext
+                submissions {
+                    id
+                    lang
+                    timestamp
+                    statusDisplay
+                    runtime
+                    title
+                    memory
+                    titleSlug
+                }
+            }
+        }`,
+        variables: {
+          offset: offset,
+          limit: 20,
+          slug: undefined,
+        },
+      });
+
+      const headers = graphqlHeaders(leetcodeSession, leetcodeCSRFToken);
+      const response = await axios.post(GRAPHQL_URL, graphql, { headers });
+
+      if (response.data && response.data.errors && !response.data.data?.submissionList) {
+        throw new Error(`LeetCode GraphQL error: ${JSON.stringify(response.data.errors)}`);
+      }
+
+      log(`Successfully fetched submission from LeetCode, offset ${offset}`);
+      return response;
+    } catch (exception) {
+      if (retryCount >= maxRetries) {
+        throw exception;
+      }
+      log(
+        'Error fetching submissions, retrying in ' +
+          3 ** retryCount +
+          ' seconds...'
+      );
+      // There's a rate limit on LeetCode API, so wait with backoff before retrying.
+      await delay(3 ** retryCount * 1000);
+      return fetchSubmissionsPage(offset, maxRetries, retryCount + 1);
+    }
+  };
+
   do {
     log(`Getting submission from LeetCode, offset ${offset}`);
-
-    const getSubmissions = async (maxRetries, retryCount = 0) => {
-      try {
-        const graphql = JSON.stringify({
-          query: `query ($offset: Int!, $limit: Int!, $slug: String) {
-              submissionList(offset: $offset, limit: $limit, questionSlug: $slug) {
-                  hasNext
-                  submissions {
-                      id
-                      lang
-                      timestamp
-                      statusDisplay
-                      runtime
-                      title
-                      memory
-                      titleSlug
-                  }
-              }
-          }`,
-          variables: {
-            offset: offset,
-            limit: 20,
-            slug: undefined,
-          },
-        });
-
-        const headers = graphqlHeaders(leetcodeSession, leetcodeCSRFToken);
-        const response = await axios.post(
-          'https://leetcode.com/graphql/',
-          graphql,
-          { headers }
-        );
-
-        if (response.data && response.data.errors && !response.data.data?.submissionList) {
-          throw new Error(`LeetCode GraphQL error: ${JSON.stringify(response.data.errors)}`);
-        }
-
-        log(`Successfully fetched submission from LeetCode, offset ${offset}`);
-        return response;
-      } catch (exception) {
-        if (retryCount >= maxRetries) {
-          throw exception;
-        }
-        log(
-          'Error fetching submissions, retrying in ' +
-            3 ** retryCount +
-            ' seconds...'
-        );
-        // There's a rate limit on LeetCode API, so wait with backoff before retrying. 
-        await delay(3 ** retryCount * 1000);
-        return getSubmissions(maxRetries, retryCount + 1);
-      }
-    };
 
     // On the first attempt, there should be no rate limiting issues, so we fail immediately in case
     // the tokens are configured incorrectly.
     const maxRetries = response === null ? 0 : 5;
     if (response !== null) {
-      // Add a 1 second delay before all requests after the initial request. 
+      // Add a 1 second delay before all requests after the initial request.
       await delay(1000);
     }
-    response = await getSubmissions(maxRetries);
+    response = await fetchSubmissionsPage(offset, maxRetries);
     if (
       !addToSubmissions({
         response,
@@ -397,6 +396,12 @@ async function sync(inputs) {
   const questionDataCache = {};
   for (let i = submissions.length - 1; i >= 0; i--) {
     const submission = submissions[i];
+
+    // Add a small delay between each submission to avoid hitting LeetCode rate limits.
+    if (i < submissions.length - 1) {
+      await delay(500);
+    }
+
     const code = await getSubmissionCode(
       submission,
       leetcodeSession,
